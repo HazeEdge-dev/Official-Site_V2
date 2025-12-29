@@ -6,13 +6,19 @@ import nodemailer from "nodemailer";
 
 import crypto from "node:crypto";
 import fs from "node:fs";
-import fsPromises from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
+
+/**
+ * ✅ REQUIRED on Render / any reverse-proxy host
+ * Fixes express-rate-limit 500 errors caused by X-Forwarded-For headers.
+ */
+app.set("trust proxy", 1);
+
 const PORT = Number(process.env.PORT || 8787);
 
 // ---------- Body parsing ----------
@@ -37,10 +43,12 @@ const corsOptions = {
       /^http:\/\/10\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$/.test(origin) ||
       /^http:\/\/172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}:\d+$/.test(origin);
 
+    // ✅ allow exact whitelist
     if (allowedOrigins.length > 0 && allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
 
+    // ✅ dev convenience
     if (isDev && (isLocalhost || isLan)) {
       return callback(null, true);
     }
@@ -49,7 +57,7 @@ const corsOptions = {
   },
   credentials: true,
   methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Admin-Key"],
+  allowedHeaders: ["Content-Type", "Authorization"],
 };
 
 app.use(cors(corsOptions));
@@ -84,13 +92,6 @@ const proposalsViewLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-const newsletterLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
 // ---------- Health ----------
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
@@ -117,282 +118,13 @@ function createTransporter() {
     port,
     secure,
     auth: { user, pass },
+
+    // ✅ prevents long hangs -> avoids Netlify 504
+    connectionTimeout: 15_000,
+    greetingTimeout: 15_000,
+    socketTimeout: 20_000,
   });
 }
-
-// =====================================================
-// ✅ NEWSLETTER: subscribe / unsubscribe / send (admin)
-// =====================================================
-
-const DATA_DIR =
-  process.env.RENDER === "true"
-    ? "/var/data"
-    : path.join(__dirname, "data");
-const NEWSLETTER_FILE = path.join(DATA_DIR, "newsletter_subscribers.json");
-
-async function ensureNewsletterFile() {
-  await fsPromises.mkdir(DATA_DIR, { recursive: true });
-  try {
-    await fsPromises.access(NEWSLETTER_FILE);
-  } catch {
-    await fsPromises.writeFile(NEWSLETTER_FILE, JSON.stringify([], null, 2), "utf-8");
-  }
-}
-
-async function readNewsletterSubscribers() {
-  await ensureNewsletterFile();
-  const raw = await fsPromises.readFile(NEWSLETTER_FILE, "utf-8");
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-async function writeNewsletterSubscribers(list) {
-  await ensureNewsletterFile();
-  await fsPromises.writeFile(NEWSLETTER_FILE, JSON.stringify(list, null, 2), "utf-8");
-}
-
-function normalizeEmail(v) {
-  return String(v || "").trim().toLowerCase();
-}
-
-function isValidEmail(v) {
-  const email = normalizeEmail(v);
-  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email);
-}
-
-function publicBaseUrl() {
-  const base =
-    process.env.PUBLIC_BASE_URL ||
-    process.env.PUBLIC_SITE_URL ||
-    `http://localhost:${PORT}`;
-  return String(base).replace(/\/$/, "");
-}
-
-function unsubscribeUrl(token) {
-  return `${publicBaseUrl()}/api/newsletter/unsubscribe?token=${encodeURIComponent(token)}`;
-}
-
-// 1) Subscribe
-app.post("/api/newsletter/subscribe", newsletterLimiter, async (req, res) => {
-  try {
-    const { email } = req.body || {};
-
-    if (!isValidEmail(email)) {
-      return res.status(400).json({ error: "Invalid email address" });
-    }
-
-    const normalized = normalizeEmail(email);
-    const now = new Date().toISOString();
-
-    const list = await readNewsletterSubscribers();
-    const idx = list.findIndex((s) => normalizeEmail(s?.email) === normalized);
-
-    let token;
-    if (idx === -1) {
-      token = crypto.randomBytes(24).toString("hex");
-      list.push({
-        email: normalized,
-        status: "active",
-        token,
-        created_at: now,
-        updated_at: now,
-      });
-    } else {
-      const cur = list[idx] || {};
-      const wasUnsubscribed = String(cur.status || "") !== "active";
-
-      token = wasUnsubscribed
-        ? crypto.randomBytes(24).toString("hex")
-        : cur.token || crypto.randomBytes(24).toString("hex");
-
-      list[idx] = {
-        ...cur,
-        email: normalized,
-        status: "active",
-        token,
-        unsubscribed_at: wasUnsubscribed ? null : cur.unsubscribed_at || null,
-        updated_at: now,
-      };
-    }
-
-    await writeNewsletterSubscribers(list);
-
-    // Optional: welcome email (deterministic test + includes unsubscribe link)
-    const sendWelcome =
-      String(process.env.NEWSLETTER_SEND_WELCOME || "true").toLowerCase() !== "false";
-
-    if (sendWelcome) {
-      try {
-        const transporter = createTransporter();
-        const to = normalized;
-        const from =
-          process.env.NEWSLETTER_FROM ||
-          process.env.FROM_EMAIL ||
-          process.env.SMTP_USER ||
-          process.env.COMPANY_EMAIL ||
-          "contact@hazeedge.com";
-
-        const unsub = unsubscribeUrl(token);
-
-        await transporter.sendMail({
-          from,
-          to,
-          subject: "You're subscribed — HazeEdge updates",
-          text: `You're subscribed to HazeEdge updates.\n\nUnsubscribe anytime: ${unsub}`,
-          html: `
-            <div style="font-family: Arial, sans-serif; line-height: 1.6;">
-              <h2>You're subscribed</h2>
-              <p>Thanks for subscribing. We'll email you when we publish new insights, playbooks, and research.</p>
-              <p style="margin-top:16px; font-size:12px; color:#555;">
-                Unsubscribe anytime: <a href="${unsub}">Unsubscribe</a>
-              </p>
-            </div>
-          `,
-        });
-      } catch (e) {
-        console.error("NEWSLETTER_WELCOME_EMAIL_ERROR:", e);
-      }
-    }
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("NEWSLETTER_SUBSCRIBE_ERROR:", err);
-    return res.status(500).json({ error: "Server failed to subscribe" });
-  }
-});
-
-// 2) Unsubscribe
-app.get("/api/newsletter/unsubscribe", async (req, res) => {
-  try {
-    const token = typeof req.query?.token === "string" ? req.query.token : "";
-    const now = new Date().toISOString();
-
-    if (token) {
-      const list = await readNewsletterSubscribers();
-      const idx = list.findIndex((s) => String(s?.token || "") === token);
-      if (idx !== -1) {
-        list[idx] = {
-          ...list[idx],
-          status: "unsubscribed",
-          unsubscribed_at: now,
-          updated_at: now,
-        };
-        await writeNewsletterSubscribers(list);
-      }
-    }
-
-    res.setHeader("Content-Type", "text/html; charset=utf-8");
-    return res.status(200).send(`
-      <!doctype html>
-      <html lang="en">
-        <head>
-          <meta charset="utf-8" />
-          <meta name="viewport" content="width=device-width, initial-scale=1" />
-          <title>Unsubscribed</title>
-          <style>
-            body{font-family:Arial,sans-serif;background:#f6f7fb;margin:0;padding:40px;color:#0f172a;}
-            .card{max-width:640px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:28px;box-shadow:0 10px 30px rgba(2,6,23,.06)}
-            h1{margin:0 0 10px;font-size:22px}
-            p{margin:0 0 14px;line-height:1.6;color:#334155}
-            a{color:#004aad;text-decoration:none}
-            a:hover{text-decoration:underline}
-          </style>
-        </head>
-        <body>
-          <div class="card">
-            <h1>You're unsubscribed</h1>
-            <p>You will no longer receive HazeEdge updates.</p>
-            <p><a href="${publicBaseUrl()}">Return to HazeEdge</a></p>
-          </div>
-        </body>
-      </html>
-    `);
-  } catch (err) {
-    console.error("NEWSLETTER_UNSUBSCRIBE_ERROR:", err);
-    return res.status(500).json({ error: "Server failed to unsubscribe" });
-  }
-});
-
-// 3) Send newsletter to all active subscribers (admin-only)
-// Use header: X-Admin-Key: <NEWSLETTER_ADMIN_KEY>
-app.post("/api/newsletter/send", async (req, res) => {
-  try {
-    const adminKey = process.env.NEWSLETTER_ADMIN_KEY;
-    if (!adminKey) {
-      return res.status(501).json({
-        error: "Set NEWSLETTER_ADMIN_KEY in backend/.env to enable sending.",
-      });
-    }
-
-    const incomingKey = String(req.headers["x-admin-key"] || "");
-    if (incomingKey !== adminKey) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-
-    const { subject, html, text } = req.body || {};
-
-    if (!subject || typeof subject !== "string") {
-      return res.status(400).json({ error: "Missing required field: subject" });
-    }
-
-    if (!html && !text) {
-      return res.status(400).json({ error: "Provide html and/or text" });
-    }
-
-    const list = await readNewsletterSubscribers();
-    const active = list.filter((s) => s?.status === "active" && isValidEmail(s?.email));
-
-    const transporter = createTransporter();
-    const from =
-      process.env.NEWSLETTER_FROM ||
-      process.env.FROM_EMAIL ||
-      process.env.SMTP_USER ||
-      process.env.COMPANY_EMAIL ||
-      "contact@hazeedge.com";
-
-    let sent = 0;
-    let failed = 0;
-
-    for (const sub of active) {
-      try {
-        const unsub = unsubscribeUrl(sub.token);
-
-        const footerHtml = `
-          <hr style="margin:24px 0;border:0;border-top:1px solid #e5e7eb"/>
-          <p style="font-size:12px;color:#64748b;margin:0;">
-            You're receiving this because you subscribed on HazeEdge.
-            <a href="${unsub}">Unsubscribe</a>
-          </p>
-        `;
-
-        const finalHtml = `${html ? String(html) : `<p>${escapeHtml(text || "")}</p>`}${footerHtml}`;
-        const finalText = `${text ? String(text) : ""}\n\nUnsubscribe: ${unsub}`.trim();
-
-        await transporter.sendMail({
-          from,
-          to: normalizeEmail(sub.email),
-          subject: String(subject),
-          ...(finalHtml ? { html: finalHtml } : {}),
-          ...(finalText ? { text: finalText } : {}),
-        });
-
-        sent += 1;
-      } catch (e) {
-        failed += 1;
-        console.error("NEWSLETTER_SEND_ONE_ERROR:", e);
-      }
-    }
-
-    return res.json({ ok: true, sent, failed });
-  } catch (err) {
-    console.error("NEWSLETTER_SEND_ERROR:", err);
-    return res.status(500).json({ error: "Server failed to send newsletter" });
-  }
-});
 
 // ---------- Contact endpoint ----------
 app.post("/api/contact", contactLimiter, async (req, res) => {
@@ -644,116 +376,6 @@ app.post("/api/careers/general", careersLimiter, async (req, res) => {
   }
 });
 
-// ===============================
-// ✅ PROPOSALS: view-only endpoint
-// ===============================
-
-const PROPOSALS_DIR = path.join(__dirname, "private", "proposals");
-const TOKEN_SECRET = process.env.PROPOSAL_TOKEN_SECRET || "";
-const TOKEN_TTL_SECONDS = Number(process.env.PROPOSAL_TOKEN_TTL_SECONDS || 120);
-
-function isSafeKey(key) {
-  return typeof key === "string" && /^[a-z0-9_-]+$/i.test(key);
-}
-
-function signToken(payloadObj) {
-  if (!TOKEN_SECRET) throw new Error("Missing PROPOSAL_TOKEN_SECRET");
-  const payloadB64 = Buffer.from(JSON.stringify(payloadObj)).toString("base64url");
-  const sig = crypto.createHmac("sha256", TOKEN_SECRET).update(payloadB64).digest("base64url");
-  return `${payloadB64}.${sig}`;
-}
-
-function verifyToken(token) {
-  if (!TOKEN_SECRET) return { ok: false, error: "Server not configured" };
-  if (!token || typeof token !== "string") return { ok: false, error: "Missing token" };
-
-  const parts = token.split(".");
-  if (parts.length !== 2) return { ok: false, error: "Bad token format" };
-
-  const [payloadB64, sig] = parts;
-  const expected = crypto.createHmac("sha256", TOKEN_SECRET).update(payloadB64).digest("base64url");
-
-  // timing-safe compare
-  const a = Buffer.from(sig);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length) return { ok: false, error: "Invalid token" };
-  if (!crypto.timingSafeEqual(a, b)) return { ok: false, error: "Invalid token" };
-
-  let payload;
-  try {
-    payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
-  } catch {
-    return { ok: false, error: "Invalid token payload" };
-  }
-
-  if (!payload || typeof payload !== "object") return { ok: false, error: "Invalid token payload" };
-  if (!payload.docKey || !isSafeKey(payload.docKey)) return { ok: false, error: "Invalid docKey" };
-  if (!payload.exp || typeof payload.exp !== "number") return { ok: false, error: "Invalid exp" };
-
-  const now = Math.floor(Date.now() / 1000);
-  if (now > payload.exp) return { ok: false, error: "Token expired" };
-
-  return { ok: true, payload };
-}
-
-// 1) Get a short-lived token for a proposal
-app.post("/api/proposals/token", proposalsTokenLimiter, (req, res) => {
-  try {
-    const { docKey } = req.body || {};
-    if (!isSafeKey(docKey)) return res.status(400).json({ error: "Invalid docKey" });
-
-    const filePath = path.join(PROPOSALS_DIR, `${docKey}.pdf`);
-    if (!fs.existsSync(filePath)) return res.status(404).json({ error: "Proposal not found" });
-
-    const exp = Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS;
-    const token = signToken({ docKey, exp });
-
-    return res.json({ token, exp });
-  } catch (e) {
-    console.error("PROPOSAL_TOKEN_ERROR:", e);
-    return res.status(500).json({ error: "Failed to issue token" });
-  }
-});
-
-// 2) Stream the PDF (no-store + inline). Frontend should fetch and render it.
-app.get("/api/proposals/:docKey", proposalsViewLimiter, (req, res) => {
-  try {
-    const docKey = req.params.docKey;
-    const token = String(req.query.token || "");
-
-    if (!isSafeKey(docKey)) return res.status(400).json({ error: "Invalid docKey" });
-
-    const v = verifyToken(token);
-    if (!v.ok) return res.status(401).json({ error: v.error || "Unauthorized" });
-    if (v.payload.docKey !== docKey) return res.status(401).json({ error: "Token doc mismatch" });
-
-    const filePath = path.join(PROPOSALS_DIR, `${docKey}.pdf`);
-    if (!fs.existsSync(filePath)) return res.status(404).json({ error: "Proposal not found" });
-
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `inline; filename="${docKey}.pdf"`);
-
-    // “view-only” style headers (deterrents + no caching)
-    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-    res.setHeader("Pragma", "no-cache");
-    res.setHeader("Expires", "0");
-    res.setHeader("Surrogate-Control", "no-store");
-    res.setHeader("X-Content-Type-Options", "nosniff");
-    res.setHeader("Cross-Origin-Resource-Policy", "same-site");
-
-    // Stream file
-    const stream = fs.createReadStream(filePath);
-    stream.on("error", (err) => {
-      console.error("PROPOSAL_STREAM_ERROR:", err);
-      res.status(500).end();
-    });
-    stream.pipe(res);
-  } catch (e) {
-    console.error("PROPOSAL_VIEW_ERROR:", e);
-    return res.status(500).json({ error: "Failed to serve proposal" });
-  }
-});
-
 // ---------- Error handler ----------
 app.use((err, _req, res, _next) => {
   console.error("UNHANDLED_ERROR:", err);
@@ -761,7 +383,7 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`HazeEdge local backend running on http://localhost:${PORT}`);
+  console.log(`HazeEdge backend running on port ${PORT}`);
 });
 
 // ---------- helper ----------
