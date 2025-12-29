@@ -17,7 +17,9 @@ const app = express();
  * ✅ REQUIRED on Render / any reverse-proxy host
  * Fixes express-rate-limit 500 errors caused by X-Forwarded-For headers.
  */
-app.set("trust proxy", 1);
+// ✅ safer than true, and works across Cloudflare/Render/Netlify setups
+app.set("trust proxy", Number(process.env.TRUST_PROXY || 2));
+
 
 const PORT = Number(process.env.PORT || 8787);
 
