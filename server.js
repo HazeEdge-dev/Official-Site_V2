@@ -2,591 +2,214 @@ import cors from "cors";
 import "dotenv/config";
 import express from "express";
 import rateLimit from "express-rate-limit";
-import nodemailer from "nodemailer";
+import { Resend } from "resend";
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import fsPromises from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const app = express();
-const PORT = Number(process.env.PORT || 8787);
 
-// ✅ REQUIRED on Render / reverse-proxy hosts (Cloudflare/Render/etc.)
-// Set TRUST_PROXY in Render env (usually 1–3). Start with 2 if unsure.
-app.set("trust proxy", Number(process.env.TRUST_PROXY || 2));
+const app = express();
+
+// ✅ REQUIRED on Render / any reverse-proxy host (fixes express-rate-limit + req.ip)
+app.set("trust proxy", 1);
+
+const PORT = Number(process.env.PORT || 8787);
 
 // ---------- Body parsing ----------
 app.use(express.json({ limit: "1mb" }));
 
 // ---------- CORS ----------
-const allowedOrigins = (process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || "")
+const allowedOrigins = String(process.env.CORS_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-function normalizeOrigin(o) {
-  if (!o) return "";
-  return String(o).trim().replace(/\/+$/, "");
-}
-function stripProto(o) {
-  return normalizeOrigin(o).replace(/^https?:\/\//i, "");
-}
-
 const corsOptions = {
   origin(origin, callback) {
-    if (!origin) return callback(null, true); // curl / server-to-server
+    if (!origin) return callback(null, true);
 
-    const o = normalizeOrigin(origin);
-    const oNoProto = stripProto(o);
-
-    // ✅ allow exact whitelist (+ tolerate missing scheme in env)
-    if (allowedOrigins.length > 0) {
-      const ok =
-        allowedOrigins.some((x) => normalizeOrigin(x) === o) ||
-        allowedOrigins.some((x) => stripProto(x) === oNoProto);
-      if (ok) return callback(null, true);
-    }
-
-    // ✅ dev convenience
     const isDev = process.env.NODE_ENV !== "production";
     const isLocalhost =
-      o.startsWith("http://localhost:") || o.startsWith("http://127.0.0.1:");
-    const isLan =
-      /^http:\/\/192\.168\.\d{1,3}\.\d{1,3}:\d+$/.test(o) ||
-      /^http:\/\/10\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$/.test(o) ||
-      /^http:\/\/172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}:\d+$/.test(o);
+      origin.startsWith("http://localhost:") || origin.startsWith("http://127.0.0.1:");
 
-    if (isDev && (isLocalhost || isLan)) return callback(null, true);
+    const isLan =
+      /^http:\/\/192\.168\.\d{1,3}\.\d{1,3}:\d+$/.test(origin) ||
+      /^http:\/\/10\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$/.test(origin) ||
+      /^http:\/\/172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}:\d+$/.test(origin);
+
+    if (allowedOrigins.length > 0 && allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    // Allow localhost/LAN only in dev
+    if (isDev && (isLocalhost || isLan)) {
+      return callback(null, true);
+    }
 
     return callback(new Error(`CORS blocked: ${origin}`));
   },
   credentials: true,
   methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Admin-Key"],
 };
 
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
 
-// ---------- Rate limiting ----------
-const contactLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 12,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-const careersLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 12,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-const proposalsTokenLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-const proposalsViewLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 200,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-const newsletterLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 40,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+// ---------- Rate limit ----------
+app.use(
+  "/api/",
+  rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
 
 // ---------- Health ----------
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-// ✅ TEMP DEBUG (remove later)
-app.get("/api/debug/ip", (req, res) => {
-  res.json({
-    ip: req.ip,
-    ips: req.ips,
-    xForwardedFor: req.headers["x-forwarded-for"] || null,
-    cfConnectingIp: req.headers["cf-connecting-ip"] || null,
-    remoteAddress: req.socket?.remoteAddress || null,
-    trustProxy: req.app.get("trust proxy"),
-  });
-});
+// =========================
+// ✅ RESEND (HTTP EMAIL)
+// =========================
+const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
-// ---------- Mail transporter ----------
-function createTransporter() {
-  const host = process.env.SMTP_HOST;
-  const port = Number(process.env.SMTP_PORT || 587);
-  const secure =
-    String(process.env.SMTP_SECURE || "").toLowerCase() === "true" || port === 465;
-
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
-
-  if (!host || !user || !pass) {
-    throw new Error("Missing SMTP env. Required: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS");
+async function sendEmail({ from, to, subject, text, html, replyTo }) {
+  if (!resend) {
+    throw new Error("Missing RESEND_API_KEY (set it in your environment variables)");
   }
 
-  return nodemailer.createTransport({
-    host,
-    port,
-    secure,
-    auth: { user, pass },
-
-    // ✅ prevents long hangs (and Netlify/CF timeouts)
-    connectionTimeout: 15_000,
-    greetingTimeout: 15_000,
-    socketTimeout: 20_000,
-  });
-}
-
-function shouldExposeErrorDetails() {
-  return process.env.NODE_ENV !== "production" || String(process.env.EXPOSE_ERROR_DETAILS) === "true";
-}
-
-function formatErr(err) {
-  const e = err || {};
-  return {
-    message: e?.message || String(err),
-    code: e?.code,
-    command: e?.command,
-    response: e?.response,
-    responseCode: e?.responseCode,
+  const payload = {
+    from,
+    to,
+    subject,
+    ...(html ? { html } : {}),
+    ...(text ? { text } : {}),
+    ...(replyTo ? { replyTo } : {}),
   };
+
+  const { data, error } = await resend.emails.send(payload);
+  if (error) {
+    throw new Error(error.message || JSON.stringify(error));
+  }
+  return data;
+}
+
+// =====================================================
+// ✅ NEWSLETTER: subscribe / unsubscribe / send (admin)
+// =====================================================
+
+const DATA_DIR =
+  process.env.RENDER === "true" ? "/var/data" : path.join(__dirname, "data");
+
+const NEWSLETTER_FILE = path.join(DATA_DIR, "newsletter_subscribers.json");
+
+async function ensureDataDir() {
+  await fsPromises.mkdir(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(NEWSLETTER_FILE)) {
+    await fsPromises.writeFile(NEWSLETTER_FILE, JSON.stringify([], null, 2), "utf8");
+  }
+}
+
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
 }
 
 function isValidEmail(email) {
-  const s = String(email || "").trim();
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+  const e = normalizeEmail(email);
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 }
 
-// ---------- Contact endpoint ----------
-app.post("/api/contact", contactLimiter, async (req, res) => {
+async function readNewsletterSubscribers() {
+  await ensureDataDir();
+  const raw = await fsPromises.readFile(NEWSLETTER_FILE, "utf8");
   try {
-    const { name, workEmail, company = "", role = "", budget = "", message } = req.body || {};
-
-    if (!name || !workEmail || !message) {
-      return res.status(400).json({ error: "Missing required fields: name, workEmail, message" });
-    }
-    if (!isValidEmail(workEmail)) {
-      return res.status(400).json({ error: "Invalid workEmail" });
-    }
-
-    const to = process.env.COMPANY_EMAIL || "contact@hazeedge.com";
-    const from = process.env.FROM_EMAIL || process.env.SMTP_USER || to;
-
-    const subject = `New website message: ${name}${company ? ` (${company})` : ""}`;
-
-    const text = [
-      "New contact form submission",
-      "--------------------------",
-      `Name: ${name}`,
-      `Work Email: ${workEmail}`,
-      `Company: ${company || "-"}`,
-      `Role: ${role || "-"}`,
-      `Budget: ${budget || "-"}`,
-      "",
-      "Message:",
-      message,
-    ].join("\n");
-
-    const html = `
-      <div style="font-family: Arial, sans-serif; line-height: 1.5;">
-        <h2>New contact form submission</h2>
-        <hr/>
-        <p><b>Name:</b> ${escapeHtml(name)}</p>
-        <p><b>Work Email:</b> ${escapeHtml(workEmail)}</p>
-        <p><b>Company:</b> ${escapeHtml(company || "-")}</p>
-        <p><b>Role:</b> ${escapeHtml(role || "-")}</p>
-        <p><b>Budget:</b> ${escapeHtml(budget || "-")}</p>
-        <h3>Message</h3>
-        <pre style="white-space: pre-wrap; background:#f7f7f7; padding:12px; border-radius:8px;">${escapeHtml(
-          message
-        )}</pre>
-      </div>
-    `;
-
-    const transporter = createTransporter();
-
-    await transporter.sendMail({
-      from,
-      to,
-      replyTo: workEmail,
-      subject,
-      text,
-      html,
-    });
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("CONTACT_SEND_ERROR:", err);
-    return res.status(500).json({
-      error: "Server failed to send email",
-      ...(shouldExposeErrorDetails() ? { detail: formatErr(err) } : {}),
-    });
-  }
-});
-
-// ---------- Careers: role-specific application ----------
-app.post("/api/careers/apply", careersLimiter, async (req, res) => {
-  try {
-    const {
-      roleId = "",
-      roleTitle,
-      name,
-      email,
-      linkedin = "",
-      resumeUrl = "",
-      note = "",
-      acceptedPolicies = false,
-    } = req.body || {};
-
-    if (!roleTitle || !name || !email) {
-      return res.status(400).json({ error: "Missing required fields: roleTitle, name, email" });
-    }
-    if (!isValidEmail(email)) return res.status(400).json({ error: "Invalid email" });
-
-    if (!acceptedPolicies) {
-      return res.status(400).json({ error: "You must accept Terms & Privacy to submit." });
-    }
-
-    const to = process.env.CAREERS_EMAIL || process.env.COMPANY_EMAIL || "contact@hazeedge.com";
-    const from = process.env.FROM_EMAIL || process.env.SMTP_USER || to;
-
-    const subject = `Application for "${String(roleTitle).trim()}"`;
-
-    const text = [
-      "New career application (Posting)",
-      "-------------------------------",
-      `Posting: ${roleTitle}`,
-      `Role ID: ${roleId || "-"}`,
-      "",
-      `Applicant: ${name}`,
-      `Email: ${email}`,
-      `LinkedIn/GitHub: ${linkedin || "-"}`,
-      `Resume URL: ${resumeUrl || "-"}`,
-      `Accepted Terms/Privacy: Yes`,
-      "",
-      "Why HazeEdge:",
-      note || "-",
-    ].join("\n");
-
-    const html = `
-      <div style="font-family: Arial, sans-serif; line-height: 1.5;">
-        <h2>New career application (Posting)</h2>
-        <hr/>
-        <p><b>Posting:</b> ${escapeHtml(roleTitle)}</p>
-        <p><b>Role ID:</b> ${escapeHtml(roleId || "-")}</p>
-
-        <h3>Applicant</h3>
-        <p><b>Name:</b> ${escapeHtml(name)}</p>
-        <p><b>Email:</b> ${escapeHtml(email)}</p>
-        <p><b>LinkedIn/GitHub:</b> ${escapeHtml(linkedin || "-")}</p>
-        <p><b>Resume URL:</b> ${
-          resumeUrl ? `<a href="${escapeHtml(resumeUrl)}">${escapeHtml(resumeUrl)}</a>` : "-"
-        }</p>
-        <p><b>Accepted Terms/Privacy:</b> Yes</p>
-
-        <h3>Why HazeEdge?</h3>
-        <pre style="white-space: pre-wrap; background:#f7f7f7; padding:12px; border-radius:8px;">${escapeHtml(
-          note || "-"
-        )}</pre>
-      </div>
-    `;
-
-    const transporter = createTransporter();
-
-    await transporter.sendMail({
-      from,
-      to,
-      replyTo: email,
-      subject,
-      text,
-      html,
-    });
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("CAREERS_APPLY_ERROR:", err);
-    return res.status(500).json({
-      error: "Server failed to send application email",
-      ...(shouldExposeErrorDetails() ? { detail: formatErr(err) } : {}),
-    });
-  }
-});
-
-// ---------- Careers: general application ----------
-app.post("/api/careers/general", careersLimiter, async (req, res) => {
-  try {
-    const { name, email, roleInterest = "", linkedin = "", note = "", acceptedPolicies = false } =
-      req.body || {};
-
-    if (!name || !email) {
-      return res.status(400).json({ error: "Missing required fields: name, email" });
-    }
-    if (!isValidEmail(email)) return res.status(400).json({ error: "Invalid email" });
-
-    if (!acceptedPolicies) {
-      return res.status(400).json({ error: "You must accept Terms & Privacy to submit." });
-    }
-
-    const to = process.env.CAREERS_EMAIL || process.env.COMPANY_EMAIL || "contact@hazeedge.com";
-    const from = process.env.FROM_EMAIL || process.env.SMTP_USER || to;
-
-    const cleanedRole = String(roleInterest || "").trim();
-    const subject = cleanedRole ? `General Application — ${cleanedRole}` : "General Application";
-
-    const text = [
-      "New career application (General)",
-      "-------------------------------",
-      `Role of Interest: ${cleanedRole || "-"}`,
-      "",
-      `Applicant: ${name}`,
-      `Email: ${email}`,
-      `LinkedIn/GitHub: ${linkedin || "-"}`,
-      `Accepted Terms/Privacy: Yes`,
-      "",
-      "Why HazeEdge:",
-      note || "-",
-    ].join("\n");
-
-    const html = `
-      <div style="font-family: Arial, sans-serif; line-height: 1.5;">
-        <h2>New career application (General)</h2>
-        <hr/>
-        <p><b>Role of Interest:</b> ${escapeHtml(cleanedRole || "-")}</p>
-
-        <h3>Applicant</h3>
-        <p><b>Name:</b> ${escapeHtml(name)}</p>
-        <p><b>Email:</b> ${escapeHtml(email)}</p>
-        <p><b>LinkedIn/GitHub:</b> ${escapeHtml(linkedin || "-")}</p>
-        <p><b>Accepted Terms/Privacy:</b> Yes</p>
-
-        <h3>Why HazeEdge?</h3>
-        <pre style="white-space: pre-wrap; background:#f7f7f7; padding:12px; border-radius:8px;">${escapeHtml(
-          note || "-"
-        )}</pre>
-      </div>
-    `;
-
-    const transporter = createTransporter();
-
-    await transporter.sendMail({
-      from,
-      to,
-      replyTo: email,
-      subject,
-      text,
-      html,
-    });
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("CAREERS_GENERAL_ERROR:", err);
-    return res.status(500).json({
-      error: "Server failed to send general application email",
-      ...(shouldExposeErrorDetails() ? { detail: formatErr(err) } : {}),
-    });
-  }
-});
-
-// ===============================
-// ✅ PROPOSALS: view-only endpoint
-// ===============================
-const PROPOSALS_DIR = path.join(__dirname, "private", "proposals");
-const TOKEN_SECRET = process.env.PROPOSAL_TOKEN_SECRET || "";
-const TOKEN_TTL_SECONDS = Number(process.env.PROPOSAL_TOKEN_TTL_SECONDS || 120);
-
-function isSafeKey(key) {
-  return typeof key === "string" && /^[a-z0-9_-]+$/i.test(key);
-}
-
-function signToken(payloadObj) {
-  if (!TOKEN_SECRET) throw new Error("Missing PROPOSAL_TOKEN_SECRET");
-  const payloadB64 = Buffer.from(JSON.stringify(payloadObj)).toString("base64url");
-  const sig = crypto.createHmac("sha256", TOKEN_SECRET).update(payloadB64).digest("base64url");
-  return `${payloadB64}.${sig}`;
-}
-
-function verifyToken(token) {
-  if (!TOKEN_SECRET) return { ok: false, error: "Server not configured" };
-  if (!token || typeof token !== "string") return { ok: false, error: "Missing token" };
-
-  const parts = token.split(".");
-  if (parts.length !== 2) return { ok: false, error: "Bad token format" };
-
-  const [payloadB64, sig] = parts;
-  const expected = crypto.createHmac("sha256", TOKEN_SECRET).update(payloadB64).digest("base64url");
-
-  const a = Buffer.from(sig);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length) return { ok: false, error: "Invalid token" };
-  if (!crypto.timingSafeEqual(a, b)) return { ok: false, error: "Invalid token" };
-
-  let payload;
-  try {
-    payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
-    return { ok: false, error: "Invalid token payload" };
-  }
-
-  if (!payload?.docKey || !isSafeKey(payload.docKey)) return { ok: false, error: "Invalid docKey" };
-  if (!payload?.exp || typeof payload.exp !== "number") return { ok: false, error: "Invalid exp" };
-
-  const now = Math.floor(Date.now() / 1000);
-  if (now > payload.exp) return { ok: false, error: "Token expired" };
-
-  return { ok: true, payload };
-}
-
-app.post("/api/proposals/token", proposalsTokenLimiter, (req, res) => {
-  try {
-    const { docKey } = req.body || {};
-    if (!isSafeKey(docKey)) return res.status(400).json({ error: "Invalid docKey" });
-
-    const filePath = path.join(PROPOSALS_DIR, `${docKey}.pdf`);
-    if (!fs.existsSync(filePath)) return res.status(404).json({ error: "Proposal not found" });
-
-    const exp = Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS;
-    const token = signToken({ docKey, exp });
-    return res.json({ token, exp });
-  } catch (e) {
-    console.error("PROPOSAL_TOKEN_ERROR:", e);
-    return res.status(500).json({
-      error: "Failed to issue token",
-      ...(shouldExposeErrorDetails() ? { detail: formatErr(e) } : {}),
-    });
-  }
-});
-
-app.get("/api/proposals/:docKey", proposalsViewLimiter, (req, res) => {
-  try {
-    const docKey = req.params.docKey;
-    const token = String(req.query.token || "");
-
-    if (!isSafeKey(docKey)) return res.status(400).json({ error: "Invalid docKey" });
-
-    const v = verifyToken(token);
-    if (!v.ok) return res.status(401).json({ error: v.error || "Unauthorized" });
-    if (v.payload.docKey !== docKey) return res.status(401).json({ error: "Token doc mismatch" });
-
-    const filePath = path.join(PROPOSALS_DIR, `${docKey}.pdf`);
-    if (!fs.existsSync(filePath)) return res.status(404).json({ error: "Proposal not found" });
-
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `inline; filename="${docKey}.pdf"`);
-
-    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-    res.setHeader("Pragma", "no-cache");
-    res.setHeader("Expires", "0");
-    res.setHeader("Surrogate-Control", "no-store");
-    res.setHeader("X-Content-Type-Options", "nosniff");
-    res.setHeader("Cross-Origin-Resource-Policy", "same-site");
-
-    const stream = fs.createReadStream(filePath);
-    stream.on("error", (err) => {
-      console.error("PROPOSAL_STREAM_ERROR:", err);
-      res.status(500).end();
-    });
-    stream.pipe(res);
-  } catch (e) {
-    console.error("PROPOSAL_VIEW_ERROR:", e);
-    return res.status(500).json({
-      error: "Failed to serve proposal",
-      ...(shouldExposeErrorDetails() ? { detail: formatErr(e) } : {}),
-    });
-  }
-});
-
-// =====================
-// ✅ NEWSLETTER (simple)
-// =====================
-const DATA_DIR = path.join(__dirname, "data");
-const NEWSLETTER_FILE = path.join(DATA_DIR, "newsletter.json");
-
-function ensureDir(p) {
-  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
-}
-
-function readNewsletter() {
-  ensureDir(DATA_DIR);
-  if (!fs.existsSync(NEWSLETTER_FILE)) return { subscribers: [] };
-  try {
-    return JSON.parse(fs.readFileSync(NEWSLETTER_FILE, "utf8"));
-  } catch {
-    return { subscribers: [] };
+    return [];
   }
 }
 
-function writeNewsletter(data) {
-  ensureDir(DATA_DIR);
-  fs.writeFileSync(NEWSLETTER_FILE, JSON.stringify(data, null, 2), "utf8");
+async function writeNewsletterSubscribers(list) {
+  await ensureDataDir();
+  await fsPromises.writeFile(NEWSLETTER_FILE, JSON.stringify(list, null, 2), "utf8");
 }
 
 function baseUrl() {
-  // Use your site domain for links (recommended)
-  // e.g. PUBLIC_BASE_URL=https://hazeedge.com
-  return (process.env.PUBLIC_BASE_URL || "http://localhost:8787").replace(/\/+$/, "");
+  return String(process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
 }
 
-function makeUnsubLink(token) {
-  return `${baseUrl()}/api/newsletter/unsubscribe?token=${encodeURIComponent(token)}`;
+function unsubscribeUrl(token) {
+  const base = baseUrl();
+  const url = `${base}/api/newsletter/unsubscribe?token=${encodeURIComponent(token)}`;
+  return url;
 }
 
-app.post("/api/newsletter/subscribe", newsletterLimiter, async (req, res) => {
+app.post("/api/newsletter/subscribe", async (req, res) => {
   try {
-    const email = String(req.body?.email || "").trim().toLowerCase();
-    if (!isValidEmail(email)) return res.status(400).json({ error: "Invalid email" });
+    const { email } = req.body || {};
 
-    const store = readNewsletter();
-    const existing = store.subscribers.find((s) => s.email === email);
-
-    const token = crypto.randomBytes(24).toString("base64url");
-    const now = new Date().toISOString();
-
-    if (existing) {
-      existing.unsubscribedAt = null;
-      existing.token = token; // rotate token
-      existing.updatedAt = now;
-    } else {
-      store.subscribers.push({
-        email,
-        token,
-        createdAt: now,
-        updatedAt: now,
-        unsubscribedAt: null,
-      });
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "Invalid email address" });
     }
 
-    writeNewsletter(store);
+    const normalized = normalizeEmail(email);
+    const now = new Date().toISOString();
+
+    const list = await readNewsletterSubscribers();
+    const idx = list.findIndex((s) => normalizeEmail(s?.email) === normalized);
+
+    let token;
+    if (idx === -1) {
+      token = crypto.randomBytes(24).toString("hex");
+      list.push({ email: normalized, token, status: "active", createdAt: now });
+    } else {
+      token = list[idx].token || crypto.randomBytes(24).toString("hex");
+      list[idx] = {
+        ...list[idx],
+        email: normalized,
+        token,
+        status: "active",
+        updatedAt: now,
+      };
+    }
+
+    await writeNewsletterSubscribers(list);
 
     // Optional welcome email
-    const sendWelcome = String(process.env.NEWSLETTER_SEND_WELCOME || "").toLowerCase() === "true";
-    if (sendWelcome) {
-      const from = process.env.NEWSLETTER_FROM || process.env.FROM_EMAIL || process.env.SMTP_USER;
-      const transporter = createTransporter();
-      const unsubLink = makeUnsubLink(token);
+    const sendWelcome =
+      String(process.env.NEWSLETTER_SEND_WELCOME || "true").toLowerCase() === "true";
 
-      await transporter.sendMail({
+    if (sendWelcome) {
+      const to = normalized;
+      const from =
+        process.env.NEWSLETTER_FROM ||
+        process.env.FROM_EMAIL ||
+        process.env.COMPANY_EMAIL ||
+        "contact@hazeedge.com";
+
+      const unsub = unsubscribeUrl(token);
+
+      await sendEmail({
         from,
-        to: email,
+        to,
         subject: "You're subscribed — HazeEdge updates",
-        text: `Thanks for subscribing. We'll email you when we publish new insights, playbooks, and research.\n\nUnsubscribe anytime: ${unsubLink}\n`,
+        text: `You're subscribed to HazeEdge updates.\n\nUnsubscribe anytime: ${unsub}`,
         html: `
-          <div style="font-family:Arial,sans-serif;line-height:1.6">
+          <div style="font-family: Arial, sans-serif; line-height: 1.6;">
             <h2>You're subscribed</h2>
-            <p>Thanks for subscribing. We'll email you when we publish new insights, playbooks, and research.</p>
-            <p style="margin-top:18px">Unsubscribe anytime: <a href="${unsubLink}">Unsubscribe</a></p>
+            <p>Thanks for subscribing to HazeEdge updates.</p>
+            <p style="margin-top:16px;">
+              <a href="${unsub}" style="color:#666;">Unsubscribe</a>
+            </p>
           </div>
         `,
       });
@@ -596,59 +219,369 @@ app.post("/api/newsletter/subscribe", newsletterLimiter, async (req, res) => {
   } catch (err) {
     console.error("NEWSLETTER_SUBSCRIBE_ERROR:", err);
     return res.status(500).json({
-      error: "Failed to subscribe",
-      ...(shouldExposeErrorDetails() ? { detail: formatErr(err) } : {}),
+      error: "Server failed to subscribe",
+      detail:
+        process.env.NODE_ENV !== "production" ? err?.message || String(err) : undefined,
     });
   }
 });
 
-app.get("/api/newsletter/unsubscribe", (req, res) => {
+app.get("/api/newsletter/unsubscribe", async (req, res) => {
   try {
-    const token = String(req.query.token || "");
+    const token = String(req.query.token || "").trim();
     if (!token) return res.status(400).send("Missing token");
 
-    const store = readNewsletter();
-    const sub = store.subscribers.find((s) => s.token === token);
+    const list = await readNewsletterSubscribers();
+    const idx = list.findIndex((s) => String(s?.token || "") === token);
 
-    if (sub && !sub.unsubscribedAt) {
-      sub.unsubscribedAt = new Date().toISOString();
-      sub.updatedAt = new Date().toISOString();
-      writeNewsletter(store);
+    if (idx === -1) {
+      return res.status(404).send("Invalid token");
     }
 
-    res.setHeader("Content-Type", "text/html; charset=utf-8");
-    return res.send(`
-      <div style="font-family:Arial,sans-serif;max-width:720px;margin:40px auto;line-height:1.6">
-        <h2>You're unsubscribed</h2>
-        <p>You will no longer receive HazeEdge updates.</p>
-        <p><a href="${baseUrl()}">Back to HazeEdge</a></p>
-      </div>
-    `);
+    list[idx] = { ...list[idx], status: "unsubscribed", unsubscribedAt: new Date().toISOString() };
+    await writeNewsletterSubscribers(list);
+
+    return res.send("You have been unsubscribed.");
   } catch (err) {
     console.error("NEWSLETTER_UNSUB_ERROR:", err);
-    return res.status(500).send("Failed to unsubscribe");
+    return res.status(500).send("Server error");
   }
 });
 
-// ---------- Error handler ----------
-app.use((err, _req, res, _next) => {
-  console.error("UNHANDLED_ERROR:", err);
-  res.status(500).json({
-    error: "Internal server error",
-    ...(shouldExposeErrorDetails() ? { detail: formatErr(err) } : {}),
-  });
+app.post("/api/newsletter/send", async (req, res) => {
+  try {
+    const adminKey = req.get("X-Admin-Key") || "";
+    if (!process.env.NEWSLETTER_ADMIN_KEY || adminKey !== process.env.NEWSLETTER_ADMIN_KEY) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { subject, html, text } = req.body || {};
+    if (!subject || typeof subject !== "string") {
+      return res.status(400).json({ error: "Missing subject" });
+    }
+    if (!html && !text) {
+      return res.status(400).json({ error: "Provide html and/or text" });
+    }
+
+    const list = await readNewsletterSubscribers();
+    const active = list.filter((s) => s?.status === "active" && isValidEmail(s?.email));
+
+    const from =
+      process.env.NEWSLETTER_FROM ||
+      process.env.FROM_EMAIL ||
+      process.env.COMPANY_EMAIL ||
+      "contact@hazeedge.com";
+
+    let sent = 0;
+    let failed = 0;
+
+    for (const sub of active) {
+      try {
+        const unsub = unsubscribeUrl(sub.token);
+        const finalHtml = html
+          ? `${String(html)}<hr/><p style="font-size:12px;color:#666;">Unsubscribe: <a href="${unsub}">${unsub}</a></p>`
+          : undefined;
+
+        const finalText = `${text ? String(text) : ""}\n\nUnsubscribe: ${unsub}`.trim();
+
+        await sendEmail({
+          from,
+          to: normalizeEmail(sub.email),
+          subject: String(subject),
+          html: finalHtml,
+          text: finalText,
+        });
+
+        sent++;
+      } catch (e) {
+        console.error("NEWSLETTER_SEND_ONE_ERROR:", normalizeEmail(sub.email), e);
+        failed++;
+      }
+    }
+
+    return res.json({ ok: true, total: active.length, sent, failed });
+  } catch (err) {
+    console.error("NEWSLETTER_SEND_ERROR:", err);
+    return res.status(500).json({
+      error: "Server failed to send newsletter",
+      detail:
+        process.env.NODE_ENV !== "production" ? err?.message || String(err) : undefined,
+    });
+  }
 });
 
-app.listen(PORT, () => {
-  console.log(`HazeEdge backend running on port ${PORT}`);
+// ===============================
+// ✅ CONTACT: main contact form
+// ===============================
+
+app.post("/api/contact", async (req, res) => {
+  try {
+    const { name, workEmail, company, message } = req.body || {};
+
+    if (!name || !workEmail || !message) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+    if (!isValidEmail(workEmail)) {
+      return res.status(400).json({ error: "Invalid email address" });
+    }
+
+    const to = process.env.COMPANY_EMAIL || "contact@hazeedge.com";
+    const from = process.env.FROM_EMAIL || process.env.COMPANY_EMAIL || to;
+
+    const subject = `New website message: ${name}${company ? ` (${company})` : ""}`;
+
+    const text = [
+      "New contact form submission",
+      "--------------------------",
+      `Name: ${name}`,
+      `Work Email: ${workEmail}`,
+      `Company: ${company || "-"}`,
+      "",
+      "Message:",
+      String(message),
+    ].join("\n");
+
+    const html = `
+      <div style="font-family: Arial, sans-serif; line-height: 1.6;">
+        <h2>New contact form submission</h2>
+        <p><b>Name:</b> ${String(name)}</p>
+        <p><b>Work Email:</b> ${String(workEmail)}</p>
+        <p><b>Company:</b> ${company ? String(company) : "-"}</p>
+        <hr />
+        <p style="white-space: pre-wrap;">${String(message)}</p>
+      </div>
+    `;
+
+    await sendEmail({
+      from,
+      to,
+      subject,
+      text,
+      html,
+      replyTo: normalizeEmail(workEmail),
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("CONTACT_ERROR:", err);
+    return res.status(500).json({
+      error: "Server failed to send email",
+      detail:
+        process.env.NODE_ENV !== "production" ? err?.message || String(err) : undefined,
+    });
+  }
 });
 
-// ---------- helper ----------
-function escapeHtml(input) {
-  return String(input)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+// ===============================
+// ✅ CAREERS: Apply + General
+// ===============================
+
+app.post("/api/careers/apply", async (req, res) => {
+  try {
+    const { name, email, phone, role, message, portfolio, linkedin } = req.body || {};
+
+    if (!name || !email || !role) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "Invalid email address" });
+    }
+
+    const to = process.env.CAREERS_EMAIL || process.env.COMPANY_EMAIL || "contact@hazeedge.com";
+    const from = process.env.FROM_EMAIL || process.env.COMPANY_EMAIL || to;
+
+    const subject = `Career Application: ${role} — ${name}`;
+
+    const text = [
+      "New career application",
+      "---------------------",
+      `Name: ${name}`,
+      `Email: ${email}`,
+      `Phone: ${phone || "-"}`,
+      `Role: ${role}`,
+      `Portfolio: ${portfolio || "-"}`,
+      `LinkedIn: ${linkedin || "-"}`,
+      "",
+      "Message:",
+      message ? String(message) : "-",
+    ].join("\n");
+
+    const html = `
+      <div style="font-family: Arial, sans-serif; line-height: 1.6;">
+        <h2>New career application</h2>
+        <p><b>Name:</b> ${String(name)}</p>
+        <p><b>Email:</b> ${String(email)}</p>
+        <p><b>Phone:</b> ${phone ? String(phone) : "-"}</p>
+        <p><b>Role:</b> ${String(role)}</p>
+        <p><b>Portfolio:</b> ${portfolio ? String(portfolio) : "-"}</p>
+        <p><b>LinkedIn:</b> ${linkedin ? String(linkedin) : "-"}</p>
+        <hr />
+        <p style="white-space: pre-wrap;">${message ? String(message) : "-"}</p>
+      </div>
+    `;
+
+    await sendEmail({
+      from,
+      to,
+      subject,
+      text,
+      html,
+      replyTo: normalizeEmail(email),
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("CAREERS_APPLY_ERROR:", err);
+    return res.status(500).json({
+      error: "Server failed to send application email",
+      detail:
+        process.env.NODE_ENV !== "production" ? err?.message || String(err) : undefined,
+    });
+  }
+});
+
+app.post("/api/careers/general", async (req, res) => {
+  try {
+    const { name, email, phone, message, portfolio, linkedin } = req.body || {};
+
+    if (!name || !email) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "Invalid email address" });
+    }
+
+    const to = process.env.CAREERS_EMAIL || process.env.COMPANY_EMAIL || "contact@hazeedge.com";
+    const from = process.env.FROM_EMAIL || process.env.COMPANY_EMAIL || to;
+
+    const subject = `General Application — ${name}`;
+
+    const text = [
+      "New general application",
+      "----------------------",
+      `Name: ${name}`,
+      `Email: ${email}`,
+      `Phone: ${phone || "-"}`,
+      `Portfolio: ${portfolio || "-"}`,
+      `LinkedIn: ${linkedin || "-"}`,
+      "",
+      "Message:",
+      message ? String(message) : "-",
+    ].join("\n");
+
+    const html = `
+      <div style="font-family: Arial, sans-serif; line-height: 1.6;">
+        <h2>New general application</h2>
+        <p><b>Name:</b> ${String(name)}</p>
+        <p><b>Email:</b> ${String(email)}</p>
+        <p><b>Phone:</b> ${phone ? String(phone) : "-"}</p>
+        <p><b>Portfolio:</b> ${portfolio ? String(portfolio) : "-"}</p>
+        <p><b>LinkedIn:</b> ${linkedin ? String(linkedin) : "-"}</p>
+        <hr />
+        <p style="white-space: pre-wrap;">${message ? String(message) : "-"}</p>
+      </div>
+    `;
+
+    await sendEmail({
+      from,
+      to,
+      subject,
+      text,
+      html,
+      replyTo: normalizeEmail(email),
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("CAREERS_GENERAL_ERROR:", err);
+    return res.status(500).json({
+      error: "Server failed to send general application email",
+      detail:
+        process.env.NODE_ENV !== "production" ? err?.message || String(err) : undefined,
+    });
+  }
+});
+
+// ===============================
+// ✅ PROPOSALS: view-only end
+// ===============================
+
+function proposalSecret() {
+  const s = String(process.env.PROPOSAL_TOKEN_SECRET || "");
+  if (!s) throw new Error("Missing PROPOSAL_TOKEN_SECRET");
+  return s;
 }
+
+function proposalTtlSeconds() {
+  const v = Number(process.env.PROPOSAL_TOKEN_TTL_SECONDS || 120);
+  return Number.isFinite(v) ? v : 120;
+}
+
+function signProposalToken(docKey, exp) {
+  const secret = proposalSecret();
+  const payload = `${docKey}.${exp}`;
+  const sig = crypto.createHmac("sha256", secret).update(payload).digest("hex");
+  return `${payload}.${sig}`;
+}
+
+function verifyProposalToken(token, docKey) {
+  const parts = String(token || "").split(".");
+  if (parts.length !== 3) return false;
+
+  const [k, expStr, sig] = parts;
+  if (k !== docKey) return false;
+
+  const exp = Number(expStr);
+  if (!Number.isFinite(exp)) return false;
+  if (Date.now() > exp) return false;
+
+  const expected = crypto
+    .createHmac("sha256", proposalSecret())
+    .update(`${k}.${expStr}`)
+    .digest("hex");
+
+  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+}
+
+app.post("/api/proposals/token", (req, res) => {
+  try {
+    const { docKey } = req.body || {};
+    if (!docKey) return res.status(400).json({ error: "Missing docKey" });
+
+    const exp = Date.now() + proposalTtlSeconds() * 1000;
+    const token = signProposalToken(String(docKey), exp);
+
+    return res.json({ ok: true, token, expiresAt: exp });
+  } catch (err) {
+    console.error("PROPOSAL_TOKEN_ERROR:", err);
+    return res.status(500).json({
+      error: "Server failed to issue token",
+      detail:
+        process.env.NODE_ENV !== "production" ? err?.message || String(err) : undefined,
+    });
+  }
+});
+
+app.get("/api/proposals/:docKey", (req, res) => {
+  try {
+    const docKey = String(req.params.docKey || "");
+    const token = String(req.query.token || "");
+
+    if (!docKey) return res.status(400).send("Missing docKey");
+    if (!verifyProposalToken(token, docKey)) return res.status(401).send("Unauthorized");
+
+    const filePath = path.join(__dirname, "proposals", `${docKey}.pdf`);
+    if (!fs.existsSync(filePath)) return res.status(404).send("Not found");
+
+    res.setHeader("Content-Type", "application/pdf");
+    return fs.createReadStream(filePath).pipe(res);
+  } catch (err) {
+    console.error("PROPOSAL_VIEW_ERROR:", err);
+    return res.status(500).send("Server error");
+  }
+});
+
+// ---------- Start ----------
+app.listen(PORT, () => {
+  console.log(`Backend listening on :${PORT}`);
+});
