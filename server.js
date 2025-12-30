@@ -106,8 +106,11 @@ async function sendEmail({ from, to, subject, text, html, replyTo }) {
 // ✅ NEWSLETTER: subscribe / unsubscribe / send (admin)
 // =====================================================
 
-const DATA_DIR =
-  process.env.RENDER === "true" ? "/var/data" : path.join(__dirname, "data");
+// ✅ FIX: Render can't mkdir /var/data. Use /tmp in production by default.
+// You can override with DATA_DIR env var if you want.
+const DEFAULT_DATA_DIR =
+  process.env.NODE_ENV === "production" ? "/tmp/hazeedge-data" : path.join(__dirname, "data");
+const DATA_DIR = process.env.DATA_DIR || DEFAULT_DATA_DIR;
 
 const NEWSLETTER_FILE = path.join(DATA_DIR, "newsletter_subscribers.json");
 
@@ -238,7 +241,11 @@ app.get("/api/newsletter/unsubscribe", async (req, res) => {
       return res.status(404).send("Invalid token");
     }
 
-    list[idx] = { ...list[idx], status: "unsubscribed", unsubscribedAt: new Date().toISOString() };
+    list[idx] = {
+      ...list[idx],
+      status: "unsubscribed",
+      unsubscribedAt: new Date().toISOString(),
+    };
     await writeNewsletterSubscribers(list);
 
     return res.send("You have been unsubscribed.");
