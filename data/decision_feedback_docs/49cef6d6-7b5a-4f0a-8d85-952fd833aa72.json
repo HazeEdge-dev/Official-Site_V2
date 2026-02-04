@@ -1,0 +1,17 @@
+{
+  "id": "49cef6d6-7b5a-4f0a-8d85-952fd833aa72",
+  "createdAt": "2026-02-04T08:29:20.394Z",
+  "clientName": "Anonymous",
+  "payload": {
+    "submittedAt": "2026-02-04T08:29:20.294Z",
+    "anonymous": true,
+    "decisionFactors": [
+      "Scope / requirements were not fully aligned"
+    ],
+    "acceptedPolicies": true
+  },
+  "meta": {
+    "ip": "::1",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+  }
+}
