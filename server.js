@@ -153,10 +153,33 @@ function createTransporter() {
 // ✅ NEWSLETTER: subscribe / unsubscribe / send (admin)
 // =====================================================
 
-const DATA_DIR =
-  process.env.RENDER === "true"
-    ? "/var/data"
-    : path.join(__dirname, "data");
+// Data directory (documents + small JSON indices)
+// In production, set DATA_DIR to a persistent disk mount path (e.g. /var/data on Render).
+let DATA_DIR =
+  process.env.DATA_DIR ||
+  process.env.RENDER_DISK_PATH ||
+  process.env.DISK_PATH ||
+  (process.env.RENDER === "true" ? "/var/data" : path.join(__dirname, "data"));
+
+DATA_DIR = path.resolve(DATA_DIR);
+
+// Ensure DATA_DIR is writable. If not, fall back to backend/data to avoid 500s in prod.
+try {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.accessSync(DATA_DIR, fs.constants.W_OK);
+} catch (err) {
+  console.warn("DATA_DIR_NOT_WRITABLE: falling back to local backend/data", {
+    dataDir: DATA_DIR,
+    error: err?.message || String(err),
+  });
+  DATA_DIR = path.resolve(path.join(__dirname, "data"));
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  } catch (e2) {
+    console.error("DATA_DIR_FALLBACK_FAILED:", e2);
+  }
+}
+
 const NEWSLETTER_FILE = path.join(DATA_DIR, "newsletter_subscribers.json");
 
 
@@ -578,6 +601,92 @@ app.post("/api/decision-feedback", decisionFeedbackLimiter, async (req, res) => 
   } catch (err) {
     console.error("DECISION_FEEDBACK_ERROR:", err);
     return res.status(500).json({ error: "Server failed to store feedback" });
+  }
+});
+
+// -----------------------------------------------------
+// ✅ DECISION FEEDBACK (admin): list + fetch documents
+// Protect using header: X-Admin-Key: <DECISION_FEEDBACK_ADMIN_KEY>
+// -----------------------------------------------------
+
+function requireDecisionFeedbackAdmin(req, res) {
+  const adminKey =
+    process.env.DECISION_FEEDBACK_ADMIN_KEY ||
+    process.env.ADMIN_KEY ||
+    "";
+  if (!adminKey) {
+    return res
+      .status(501)
+      .json({ error: "Admin access not configured" });
+  }
+  const incoming = String(req.headers["x-admin-key"] || "");
+  if (incoming !== adminKey) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  return null;
+}
+
+// List index (supports ?q=search)
+app.get("/api/decision-feedback/admin/list", async (req, res) => {
+  const deny = requireDecisionFeedbackAdmin(req, res);
+  if (deny) return;
+
+  try {
+    const q = String(req.query?.q || "").trim().toLowerCase();
+    const index = await readDecisionFeedbackIndex();
+    const filtered = q
+      ? index.filter((r) => String(r?.clientName || "").toLowerCase().includes(q))
+      : index;
+
+    const sorted = [...filtered].sort((a, b) =>
+      String(b?.createdAt || "").localeCompare(String(a?.createdAt || ""))
+    );
+
+    return res.json({ ok: true, count: sorted.length, items: sorted });
+  } catch (err) {
+    console.error("DECISION_FEEDBACK_ADMIN_LIST_ERROR:", err);
+    return res.status(500).json({ error: "Failed to read index" });
+  }
+});
+
+// Fetch a document by id
+// Defaults to markdown. Use ?format=json for JSON.
+app.get("/api/decision-feedback/admin/doc/:id", async (req, res) => {
+  const deny = requireDecisionFeedbackAdmin(req, res);
+  if (deny) return;
+
+  try {
+    const id = String(req.params?.id || "").trim();
+    if (!id) return res.status(400).json({ error: "Missing id" });
+
+    const format = String(req.query?.format || "md").toLowerCase();
+    const isJson = format === "json";
+    const filePath = path.join(
+      DECISION_FEEDBACK_DOCS_DIR,
+      `${id}.${isJson ? "json" : "md"}`
+    );
+
+    const content = await fsPromises.readFile(filePath, "utf-8");
+    res.setHeader(
+      "Content-Type",
+      isJson ? "application/json; charset=utf-8" : "text/markdown; charset=utf-8"
+    );
+
+    // Optional: force download via ?download=1
+    if (String(req.query?.download || "") === "1") {
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${id}.${isJson ? "json" : "md"}"`
+      );
+    }
+
+    return res.status(200).send(content);
+  } catch (err) {
+    if (String(err?.code || "") === "ENOENT") {
+      return res.status(404).json({ error: "Document not found" });
+    }
+    console.error("DECISION_FEEDBACK_ADMIN_DOC_ERROR:", err);
+    return res.status(500).json({ error: "Failed to read document" });
   }
 });
 
