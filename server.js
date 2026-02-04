@@ -23,6 +23,62 @@ function tryRequireNodemailer() {
   }
 }
 
+// -----------------------------------------------------
+// Email sending
+// -----------------------------------------------------
+// Preferred in production: Resend via HTTP API.
+// Fallback: SMTP via nodemailer (if available + configured).
+
+function getResendApiKey() {
+  const key = process.env.RESEND_API_KEY || process.env.RESEND_KEY || "";
+  return String(key).trim();
+}
+
+async function sendEmailViaResend({ from, to, replyTo, subject, html, text }) {
+  const apiKey = getResendApiKey();
+  if (!apiKey) {
+    throw new Error("Missing RESEND_API_KEY");
+  }
+
+  // Resend expects `to` to be an array.
+  const toList = Array.isArray(to) ? to : [to];
+
+  // Hard-timeout to avoid long hangs becoming 504 at the edge.
+  const controller = new AbortController();
+  const timeoutMs = Number(process.env.EMAIL_TIMEOUT_MS || 10000);
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const resp = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from,
+        to: toList,
+        subject,
+        html,
+        text,
+        reply_to: replyTo || undefined,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      throw new Error(
+        `Resend failed (${resp.status}) ${String(body).slice(0, 300)}`
+      );
+    }
+
+    return await resp.json().catch(() => ({ ok: true }));
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 const app = express();
 
 /**
@@ -146,6 +202,27 @@ function createTransporter() {
     port,
     secure,
     auth: { user, pass },
+    // Keep SMTP attempts from hanging long enough to cause 504s at the edge.
+    connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 10000),
+    greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT_MS || 10000),
+    socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 15000),
+  });
+}
+
+async function sendEmail({ from, to, replyTo, subject, html, text }) {
+  const resendKey = getResendApiKey();
+  if (resendKey) {
+    return await sendEmailViaResend({ from, to, replyTo, subject, html, text });
+  }
+
+  const transporter = createTransporter();
+  return await transporter.sendMail({
+    from,
+    to,
+    replyTo,
+    subject,
+    text,
+    html,
   });
 }
 
@@ -381,7 +458,6 @@ app.post("/api/newsletter/subscribe", newsletterLimiter, async (req, res) => {
 
     if (sendWelcome) {
       try {
-        const transporter = createTransporter();
         const to = normalized;
         const from =
           process.env.NEWSLETTER_FROM ||
@@ -392,7 +468,7 @@ app.post("/api/newsletter/subscribe", newsletterLimiter, async (req, res) => {
 
         const unsub = unsubscribeUrl(token);
 
-        await transporter.sendMail({
+        await sendEmail({
           from,
           to,
           subject: "You're subscribed — HazeEdge updates",
@@ -500,7 +576,6 @@ app.post("/api/newsletter/send", async (req, res) => {
     const list = await readNewsletterSubscribers();
     const active = list.filter((s) => s?.status === "active" && isValidEmail(s?.email));
 
-    const transporter = createTransporter();
     const from =
       process.env.NEWSLETTER_FROM ||
       process.env.FROM_EMAIL ||
@@ -526,7 +601,7 @@ app.post("/api/newsletter/send", async (req, res) => {
         const finalHtml = `${html ? String(html) : `<p>${escapeHtml(text || "")}</p>`}${footerHtml}`;
         const finalText = `${text ? String(text) : ""}\n\nUnsubscribe: ${unsub}`.trim();
 
-        await transporter.sendMail({
+        await sendEmail({
           from,
           to: normalizeEmail(sub.email),
           subject: String(subject),
@@ -735,9 +810,7 @@ app.post("/api/contact", contactLimiter, async (req, res) => {
       </div>
     `;
 
-    const transporter = createTransporter();
-
-    await transporter.sendMail({
+    await sendEmail({
       from,
       to,
       replyTo: workEmail,
@@ -830,9 +903,7 @@ app.post("/api/careers/apply", careersLimiter, async (req, res) => {
       </div>
     `;
 
-    const transporter = createTransporter();
-
-    await transporter.sendMail({
+    await sendEmail({
       from,
       to,
       replyTo: email,
@@ -918,9 +989,7 @@ app.post("/api/careers/general", careersLimiter, async (req, res) => {
       </div>
     `;
 
-    const transporter = createTransporter();
-
-    await transporter.sendMail({
+    await sendEmail({
       from,
       to,
       replyTo: email,
