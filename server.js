@@ -136,6 +136,13 @@ const contactLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+const clientIntakeLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 const careersLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 12,
@@ -762,6 +769,138 @@ app.get("/api/decision-feedback/admin/doc/:id", async (req, res) => {
     }
     console.error("DECISION_FEEDBACK_ADMIN_DOC_ERROR:", err);
     return res.status(500).json({ error: "Failed to read document" });
+  }
+});
+
+
+// ---------- Client intake endpoint ----------
+app.post("/api/client-intake", clientIntakeLimiter, async (req, res) => {
+  try {
+    const body = req.body || {};
+
+    if (body.website) {
+      return res.json({ ok: true });
+    }
+
+    const requiredFields = [
+      "signatoryName",
+      "signatoryTitle",
+      "signatoryEmail",
+      "companyLegalName",
+      "companyRegistrationNumber",
+      "country",
+      "registeredAddress",
+      "billingEmail",
+    ];
+
+    for (const field of requiredFields) {
+      if (!String(body[field] || "").trim()) {
+        return res.status(400).json({ error: `Missing required field: ${field}` });
+      }
+    }
+
+    if (!isValidEmail(body.signatoryEmail)) {
+      return res.status(400).json({ error: "Please provide a valid signatory email" });
+    }
+
+    if (!isValidEmail(body.billingEmail)) {
+      return res.status(400).json({ error: "Please provide a valid billing email" });
+    }
+
+    if (body.authorizationConfirmed !== true) {
+      return res.status(400).json({ error: "Authorization confirmation is required" });
+    }
+
+    const to = process.env.CLIENT_INTAKE_TO || process.env.COMPANY_EMAIL || "contact@hazeedge.com";
+    const from = process.env.CLIENT_INTAKE_FROM || process.env.FROM_EMAIL || process.env.SMTP_USER || to;
+    const subject = `Client engagement details: ${body.companyLegalName}`;
+
+    const text = [
+      "New client engagement-letter intake",
+      "-----------------------------------",
+      "",
+      "Authorized signatory",
+      `Name: ${body.signatoryName}`,
+      `Designation: ${body.signatoryTitle}`,
+      `Email: ${body.signatoryEmail}`,
+      `Phone / WhatsApp: ${body.signatoryPhone || "-"}`,
+      `Preferred signing method: ${body.signingMethod || "-"}`,
+      "",
+      "Company legal details",
+      `Legal name: ${body.companyLegalName}`,
+      `Trading / brand name: ${body.tradingName || "-"}`,
+      `Company registration number: ${body.companyRegistrationNumber}`,
+      `Tax / GST / VAT number: ${body.taxNumber || "-"}`,
+      `Country: ${body.country}`,
+      `Company website: ${body.companyWebsite || "-"}`,
+      `Registered address: ${body.registeredAddress}`,
+      "",
+      "Billing and routing",
+      `Billing email: ${body.billingEmail}`,
+      `Billing contact: ${body.billingContactName || "-"}`,
+      `PO / internal reference: ${body.purchaseOrder || "-"}`,
+      `Project reference: ${body.projectReference || "-"}`,
+      `Additional recipients: ${body.additionalRecipients || "-"}`,
+      "",
+      "Additional notes",
+      body.additionalNotes || "-",
+      "",
+      "Authorization confirmed: Yes",
+    ].join("\n");
+
+    const html = `
+      <div style="font-family: Arial, sans-serif; line-height: 1.55; color: #111827;">
+        <div style="padding: 18px 20px; background: #071120; color: #ffffff; border-radius: 14px 14px 0 0;">
+          <h2 style="margin: 0; font-size: 20px;">New client engagement-letter intake</h2>
+          <p style="margin: 6px 0 0; color: #bfdbfe;">Submitted from hazeedge.com/form</p>
+        </div>
+        <div style="border: 1px solid #e5e7eb; border-top: 0; border-radius: 0 0 14px 14px; padding: 20px;">
+          <h3>Authorized signatory</h3>
+          <p><b>Name:</b> ${escapeHtml(body.signatoryName)}</p>
+          <p><b>Designation:</b> ${escapeHtml(body.signatoryTitle)}</p>
+          <p><b>Email:</b> ${escapeHtml(body.signatoryEmail)}</p>
+          <p><b>Phone / WhatsApp:</b> ${escapeHtml(body.signatoryPhone || "-")}</p>
+          <p><b>Preferred signing method:</b> ${escapeHtml(body.signingMethod || "-")}</p>
+          <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 20px 0;" />
+          <h3>Company legal details</h3>
+          <p><b>Legal name:</b> ${escapeHtml(body.companyLegalName)}</p>
+          <p><b>Trading / brand name:</b> ${escapeHtml(body.tradingName || "-")}</p>
+          <p><b>Company registration number:</b> ${escapeHtml(body.companyRegistrationNumber)}</p>
+          <p><b>Tax / GST / VAT number:</b> ${escapeHtml(body.taxNumber || "-")}</p>
+          <p><b>Country:</b> ${escapeHtml(body.country)}</p>
+          <p><b>Company website:</b> ${escapeHtml(body.companyWebsite || "-")}</p>
+          <p><b>Registered address:</b></p>
+          <pre style="white-space: pre-wrap; background:#f8fafc; padding:12px; border-radius:10px; border:1px solid #e5e7eb;">${escapeHtml(body.registeredAddress)}</pre>
+          <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 20px 0;" />
+          <h3>Billing and routing</h3>
+          <p><b>Billing email:</b> ${escapeHtml(body.billingEmail)}</p>
+          <p><b>Billing contact:</b> ${escapeHtml(body.billingContactName || "-")}</p>
+          <p><b>PO / internal reference:</b> ${escapeHtml(body.purchaseOrder || "-")}</p>
+          <p><b>Project reference:</b> ${escapeHtml(body.projectReference || "-")}</p>
+          <p><b>Additional recipients:</b> ${escapeHtml(body.additionalRecipients || "-")}</p>
+          <h3>Additional notes</h3>
+          <pre style="white-space: pre-wrap; background:#f8fafc; padding:12px; border-radius:10px; border:1px solid #e5e7eb;">${escapeHtml(body.additionalNotes || "-")}</pre>
+          <p style="margin-top: 18px;"><b>Authorization confirmed:</b> Yes</p>
+        </div>
+      </div>
+    `;
+
+    await sendEmail({
+      from,
+      to,
+      replyTo: body.signatoryEmail,
+      subject,
+      text,
+      html,
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("CLIENT_INTAKE_SEND_ERROR:", err);
+    return res.status(500).json({
+      error: "Server failed to send client intake email",
+      detail: process.env.NODE_ENV !== "production" ? (err?.message || String(err)) : undefined,
+    });
   }
 });
 
